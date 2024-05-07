@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import wraps
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 from polars import functions as F
@@ -28,6 +29,21 @@ if TYPE_CHECKING:
     else:
         from typing_extensions import Self
 
+
+def iterator_guard(func):
+    """
+    Guard for iterator methods.
+
+    Schould be used on __next__ method prewenting its usage before
+    __iter__ was called and _current_index attribute does not exists.
+    """
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if not hasattr(self, '_current_index'):
+            msg = f"'{type(self).__name__}' object is not an iterator"
+            raise TypeError(msg)
+        return func(self, *args, **kwargs)
+    return wrapper
 
 class GroupBy:
     """Starts a new GroupBy operation."""
@@ -126,6 +142,7 @@ class GroupBy:
 
         return self
 
+    @iterator_guard
     def __next__(
         self,
     ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
@@ -850,6 +867,7 @@ class RollingGroupBy:
 
         return self
 
+    @iterator_guard
     def __next__(
         self,
     ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
@@ -1038,6 +1056,7 @@ class DynamicGroupBy:
 
         return self
 
+    @iterator_guard
     def __next__(
         self,
     ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
