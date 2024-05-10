@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from functools import wraps
 from typing import TYPE_CHECKING, Callable, Iterable, Iterator
 
 from polars import functions as F
@@ -29,21 +28,6 @@ if TYPE_CHECKING:
     else:
         from typing_extensions import Self
 
-
-def iterator_guard(func):
-    """
-    Guard for iterator methods.
-
-    Schould be used on __next__ method prewenting its usage before
-    __iter__ was called and _current_index attribute does not exists.
-    """
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if not hasattr(self, '_current_index'):
-            msg = f"'{type(self).__name__}' object is not an iterator"
-            raise TypeError(msg)
-        return func(self, *args, **kwargs)
-    return wrapper
 
 class GroupBy:
     """Starts a new GroupBy operation."""
@@ -79,7 +63,7 @@ class GroupBy:
         self.named_by = named_by
         self.maintain_order = maintain_order
 
-    def __iter__(self) -> Self:
+    def __iter__(self) -> GroupByIter:
         """
         Allows iteration over the groups of the group by operation.
 
@@ -113,47 +97,7 @@ class GroupBy:
         │ b   ┆ 3   │
         └─────┴─────┘
         """
-        temp_col = "__POLARS_GB_GROUP_INDICES"
-        groups_df = (
-            self.df.lazy()
-            .group_by(*self.by, **self.named_by, maintain_order=self.maintain_order)
-            .agg(F.first().agg_groups().alias(temp_col))
-            .collect(no_optimization=True)
-        )
-
-        group_names = groups_df.select(F.all().exclude(temp_col))
-
-        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
-        key_as_single_value = (
-            len(self.by) == 1 and isinstance(self.by[0], str) and not self.named_by
-        )
-        if key_as_single_value:
-            issue_deprecation_warning(
-                "`group_by` iteration will change to always return group identifiers as tuples."
-                f" Pass `by` as a list to silence this warning, e.g. `group_by([{self.by[0]!r}])`.",
-                version="0.20.4",
-            )
-            self._group_names = iter(group_names.to_series())
-        else:
-            self._group_names = group_names.iter_rows()
-
-        self._group_indices = groups_df.select(temp_col).to_series()
-        self._current_index = 0
-
-        return self
-
-    @iterator_guard
-    def __next__(
-        self,
-    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
-        if self._current_index >= len(self._group_indices):
-            raise StopIteration
-
-        group_name = next(self._group_names)
-        group_data = self.df[self._group_indices[self._current_index]]
-        self._current_index += 1
-
-        return group_name, group_data
+        return GroupByIter(self)
 
     def agg(
         self,
@@ -806,6 +750,58 @@ class GroupBy:
         return self.map_groups(function)
 
 
+class GroupByIter:
+    """Iterator class for iterating over groups produced by a GroupBy operation."""
+
+    def __init__(self, group_by_class) -> None:
+        # copy all atributes from group_by_class to self
+        self._df = group_by_class.df
+        self._by = group_by_class.by
+        self._named_by = group_by_class.named_by
+        self._maintain_order = group_by_class.maintain_order
+
+        # initialize iterator
+        temp_col = "__POLARS_GB_GROUP_INDICES"
+        groups_df = (
+            self._df.lazy()
+            .group_by(*self._by, **self._named_by, maintain_order=self._maintain_order)
+            .agg(F.first().agg_groups().alias(temp_col))
+            .collect(no_optimization=True)
+        )
+
+        group_names = groups_df.select(F.all().exclude(temp_col))
+
+        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
+        key_as_single_value = (
+            len(self._by) == 1 and isinstance(self._by[0], str) and not self._named_by
+        )
+        if key_as_single_value:
+            issue_deprecation_warning(
+                "`group_by` iteration will change to always return group identifiers as tuples."
+                f" Pass `by` as a list to silence this warning, e.g. `group_by([{self._by[0]!r}])`.",
+                version="0.20.4",
+            )
+            self._group_names = iter(group_names.to_series())
+        else:
+            self._group_names = group_names.iter_rows()
+
+        self._group_indices = groups_df.select(temp_col).to_series()
+        self._current_index = 0
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(self) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
+        if self._current_index >= len(self._group_indices):
+            raise StopIteration
+
+        group_name = next(self._group_names)
+        group_data = self._df[self._group_indices[self._current_index]]
+        self._current_index += 1
+
+        return group_name, group_data
+
+
 class RollingGroupBy:
     """
     A rolling grouper.
@@ -836,49 +832,8 @@ class RollingGroupBy:
         self.group_by = group_by
         self.check_sorted = check_sorted
 
-    def __iter__(self) -> Self:
-        temp_col = "__POLARS_GB_GROUP_INDICES"
-        groups_df = (
-            self.df.lazy()
-            .rolling(
-                index_column=self.time_column,
-                period=self.period,
-                offset=self.offset,
-                closed=self.closed,
-                group_by=self.group_by,
-                check_sorted=self.check_sorted,
-            )
-            .agg(F.first().agg_groups().alias(temp_col))
-            .collect(no_optimization=True)
-        )
-
-        group_names = groups_df.select(F.all().exclude(temp_col))
-
-        # When grouping by a single column, group name is a single value
-        # When grouping by multiple columns, group name is a tuple of values
-        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
-        if self.group_by is None:
-            self._group_names = iter(group_names.to_series())
-        else:
-            self._group_names = group_names.iter_rows()
-
-        self._group_indices = groups_df.select(temp_col).to_series()
-        self._current_index = 0
-
-        return self
-
-    @iterator_guard
-    def __next__(
-        self,
-    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
-        if self._current_index >= len(self._group_indices):
-            raise StopIteration
-
-        group_name = next(self._group_names)
-        group_data = self.df[self._group_indices[self._current_index]]
-        self._current_index += 1
-
-        return group_name, group_data
+    def __iter__(self) -> RollingGroupByIter:
+        return RollingGroupByIter(self)
 
     def agg(
         self,
@@ -979,6 +934,63 @@ class RollingGroupBy:
         return self.map_groups(function, schema)
 
 
+class RollingGroupByIter:
+    """Iterator class for iterating over groups produced by a RollingGroupBy."""
+
+    def __init__(self, rolling_group_by: RollingGroupBy) -> None:
+        # copy all atributes from group_by_class to self
+        self._df = rolling_group_by.df
+        self._time_column = rolling_group_by.time_column
+        self._period = rolling_group_by.period
+        self._offset = rolling_group_by.offset
+        self._closed = rolling_group_by.closed
+        self._group_by = rolling_group_by.group_by
+        self._check_sorted = rolling_group_by.check_sorted
+
+        # initialize iterator
+        temp_col = "__POLARS_GB_GROUP_INDICES"
+        groups_df = (
+            self._df.lazy()
+            .rolling(
+                index_column=self._time_column,
+                period=self._period,
+                offset=self._offset,
+                closed=self._closed,
+                group_by=self._group_by,
+                check_sorted=self._check_sorted,
+            )
+            .agg(F.first().agg_groups().alias(temp_col))
+            .collect(no_optimization=True)
+        )
+        group_names = groups_df.select(F.all().exclude(temp_col))
+
+        # When grouping by a single column, group name is a single value
+        # When grouping by multiple columns, group name is a tuple of values
+        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
+        if self._group_by is None:
+            self._group_names = iter(group_names.to_series())
+        else:
+            self._group_names = group_names.iter_rows()
+
+        self._group_indices = groups_df.select(temp_col).to_series()
+        self._current_index = 0
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(
+        self,
+    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
+        if self._current_index >= len(self._group_indices):
+            raise StopIteration
+
+        group_name = next(self._group_names)
+        group_data = self._df[self._group_indices[self._current_index]]
+        self._current_index += 1
+
+        return group_name, group_data
+
+
 class DynamicGroupBy:
     """
     A dynamic grouper.
@@ -1020,54 +1032,8 @@ class DynamicGroupBy:
         self.start_by = start_by
         self.check_sorted = check_sorted
 
-    def __iter__(self) -> Self:
-        temp_col = "__POLARS_GB_GROUP_INDICES"
-        groups_df = (
-            self.df.lazy()
-            .group_by_dynamic(
-                index_column=self.time_column,
-                every=self.every,
-                period=self.period,
-                offset=self.offset,
-                truncate=self.truncate,
-                label=self.label,
-                include_boundaries=self.include_boundaries,
-                closed=self.closed,
-                group_by=self.group_by,
-                start_by=self.start_by,
-                check_sorted=self.check_sorted,
-            )
-            .agg(F.first().agg_groups().alias(temp_col))
-            .collect(no_optimization=True)
-        )
-
-        group_names = groups_df.select(F.all().exclude(temp_col))
-
-        # When grouping by a single column, group name is a single value
-        # When grouping by multiple columns, group name is a tuple of values
-        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
-        if self.group_by is None:
-            self._group_names = iter(group_names.to_series())
-        else:
-            self._group_names = group_names.iter_rows()
-
-        self._group_indices = groups_df.select(temp_col).to_series()
-        self._current_index = 0
-
-        return self
-
-    @iterator_guard
-    def __next__(
-        self,
-    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
-        if self._current_index >= len(self._group_indices):
-            raise StopIteration
-
-        group_name = next(self._group_names)
-        group_data = self.df[self._group_indices[self._current_index]]
-        self._current_index += 1
-
-        return group_name, group_data
+    def __iter__(self) -> DynamicGroupByIter:
+        return DynamicGroupByIter(self)
 
     def agg(
         self,
@@ -1175,3 +1141,71 @@ class DynamicGroupBy:
             lead to errors. If set to None, polars assumes the schema is unchanged.
         """
         return self.map_groups(function, schema)
+
+
+class DynamicGroupByIter:
+    """Iterator class for iterating over groups produced by a DynamicGroupBy."""
+
+    def __init__(self, dynamic_group_by: DynamicGroupBy) -> None:
+        # copy all atributes from group_by_class to self
+        self._df = dynamic_group_by.df
+        self._time_column = dynamic_group_by.time_column
+        self._every = dynamic_group_by.every
+        self._period = dynamic_group_by.period
+        self._offset = dynamic_group_by.offset
+        self._truncate = dynamic_group_by.truncate
+        self._label = dynamic_group_by.label
+        self._include_boundaries = dynamic_group_by.include_boundaries
+        self._closed = dynamic_group_by.closed
+        self._group_by = dynamic_group_by.group_by
+        self._start_by = dynamic_group_by.start_by
+        self._check_sorted = dynamic_group_by.check_sorted
+
+        # initialize iterator
+        temp_col = "__POLARS_GB_GROUP_INDICES"
+        groups_df = (
+            self._df.lazy()
+            .group_by_dynamic(
+                index_column=self._time_column,
+                every=self._every,
+                period=self._period,
+                offset=self._offset,
+                truncate=self._truncate,
+                label=self._label,
+                include_boundaries=self._include_boundaries,
+                closed=self._closed,
+                group_by=self._group_by,
+                start_by=self._start_by,
+                check_sorted=self._check_sorted,
+            )
+            .agg(F.first().agg_groups().alias(temp_col))
+            .collect(no_optimization=True)
+        )
+
+        group_names = groups_df.select(F.all().exclude(temp_col))
+
+        # When grouping by a single column, group name is a single value
+        # When grouping by multiple columns, group name is a tuple of values
+        self._group_names: Iterator[object] | Iterator[tuple[object, ...]]
+        if self._group_by is None:
+            self._group_names = iter(group_names.to_series())
+        else:
+            self._group_names = group_names.iter_rows()
+
+        self._group_indices = groups_df.select(temp_col).to_series()
+        self._current_index = 0
+
+    def __iter__(self) -> Self:
+        return self
+
+    def __next__(
+        self,
+    ) -> tuple[object, DataFrame] | tuple[tuple[object, ...], DataFrame]:
+        if self._current_index >= len(self._group_indices):
+            raise StopIteration
+
+        group_name = next(self._group_names)
+        group_data = self._df[self._group_indices[self._current_index]]
+        self._current_index += 1
+
+        return group_name, group_data
